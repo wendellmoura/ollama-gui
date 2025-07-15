@@ -4,674 +4,827 @@ import time
 import pprint
 import platform
 import webbrowser
-
+import queue
+import urllib.error
 import urllib.parse
 import urllib.request
-
+import socket
+import traceback
+import html
+import re
 from threading import Thread
-from typing import Optional, List, Generator
+from typing import Optional, List, Generator, Tuple, Any
 
-try:
-    import tkinter as tk
-    from tkinter import ttk, font, messagebox
-
-except (ModuleNotFoundError, ImportError):
-    print(
-        "Your Python installation does not include the Tk library. \n"
-        "Please refer to https://github.com/chyok/ollama-gui?tab=readme-ov-file#-qa")
-    sys.exit(0)
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QTextEdit, QLineEdit, QComboBox, QPushButton, QProgressBar, QLabel,
+    QMessageBox, QListWidget, QScrollArea, QMenu, QDialog, QListWidgetItem,
+    QFrame, QSizePolicy, QMenuBar, QScrollBar, QStyleFactory
+)
+from PySide6.QtGui import (QTextCursor, QFont, QAction, QKeyEvent, QTextCharFormat, 
+                          QColor, QPalette, QFontMetrics, QIcon, QTextDocument)
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QObject, QSize, QEvent, QUrl
 
 __version__ = "1.2.2"
 
+# Função simplificada para formatação Markdown
+def formatar_markdown(texto: str) -> str:
+    """Converte apenas **negrito** e ### cabeçalhos"""
+    # Negrito: **texto**
+    texto = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', texto)
+    
+    # Cabeçalhos: ### Texto
+    texto = re.sub(r'^###\s+(.*)$', r'<h3>\1</h3>', texto, flags=re.MULTILINE)
+    
+    return texto
 
-def _system_check(root: tk.Tk) -> Optional[str]:
-    """
-    Detected some system and software compatibility issues,
-    and returned the information in the form of a string to alert the user
+# Classe personalizada para entrada de texto
+class EntradaUsuario(QTextEdit):
+    enterPressed = Signal()
+    
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key_Return and not event.modifiers() & Qt.ShiftModifier:
+            self.enterPressed.emit()
+            event.accept()
+        elif event.key() == Qt.Key_Return and event.modifiers() & Qt.ShiftModifier:
+            self.insertPlainText("\n")
+        else:
+            super().keyPressEvent(event)
 
-    :param root: Tk instance
-    :return: None or message string
-    """
+# Tempos de timeout configuráveis
+TIMEOUT_CONEXAO = 15
+TIMEOUT_CONVERSA = 300
+TIMEOUT_DOWNLOAD = 0
 
-    def _version_tuple(v):
-        """A lazy way to avoid importing third-party libraries"""
-        filled = []
-        for point in v.split("."):
-            filled.append(point.zfill(8))
-        return tuple(filled)
+class ModeloNaoEncontradoError(Exception):
+    pass
 
-    # Tcl and macOS issue: https://github.com/python/cpython/issues/110218
-    if platform.system().lower() == "darwin":
-        version = platform.mac_ver()[0]
-        if version and 14 <= float(version) < 15:
-            tcl_version = root.tk.call("info", "patchlevel")
-            if _version_tuple(tcl_version) <= _version_tuple("8.6.12"):
-                return (
-                    "Warning: Tkinter Responsiveness Issue Detected\n\n"
-                    "You may experience unresponsive GUI elements when "
-                    "your cursor is inside the window during startup. "
-                    "This is a known issue with Tcl/Tk versions 8.6.12 "
-                    "and older on macOS Sonoma.\n\nTo resolve this:\n"
-                    "Update to Python 3.11.7+ or 3.12+\n"
-                    "Or install Tcl/Tk 8.6.13 or newer separately\n\n"
-                    "Temporary workaround: Move your cursor out of "
-                    "the window and back in if elements become unresponsive.\n\n"
-                    "For more information, visit: https://github.com/python/cpython/issues/110218"
+class ErroConexaoError(Exception):
+    pass
+
+class ErroServidorError(Exception):
+    pass
+
+class WorkerSignals(QObject):
+    update_chat = Signal(str, str)  # (texto, tipo)
+    update_log = Signal(str, bool)
+    show_progress = Signal()
+    hide_progress = Signal()
+    enable_button = Signal(str, bool)
+    update_model_combo = Signal(list)
+    show_error = Signal(str)
+    update_model_list = Signal(list)
+
+class InterfaceOllama(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.api_url = "http://127.0.0.1:11434"
+        self.historico_chat = []
+        self.fonte_padrao = QFont().family()
+        self.fila_atualizacoes = queue.Queue()
+        self.signals = WorkerSignals()
+        self.caixa_log = None
+        self.lista_modelos = None
+        self.ultima_resposta = ""  # Para acumular a resposta do modelo
+        
+        self.setWindowTitle("Ollama GUI")
+        self.resize(800, 600)
+        
+        # Widget central
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        self.layout_principal = QVBoxLayout(central_widget)
+        self.layout_principal.setContentsMargins(20, 20, 20, 20)
+        
+        self.iniciar_layout()
+        self.conectar_sinais()
+        
+        # Verificar sistema
+        self.verificar_sistema()
+        self.atualizar_modelos()
+
+    def iniciar_layout(self):
+        # Frame cabeçalho
+        frame_cabecalho = QWidget()
+        layout_cabecalho = QHBoxLayout(frame_cabecalho)
+        layout_cabecalho.setContentsMargins(0, 0, 0, 0)
+        
+        self.seletor_modelo = QComboBox()
+        self.seletor_modelo.setMinimumWidth(200)
+        layout_cabecalho.addWidget(self.seletor_modelo)
+        
+        self.botao_config = QPushButton("⚙️")
+        self.botao_config.setFixedWidth(30)
+        layout_cabecalho.addWidget(self.botao_config)
+        self.botao_config.clicked.connect(self.mostrar_janela_gerenciamento)
+        
+        self.botao_atualizar = QPushButton("Atualizar")
+        layout_cabecalho.addWidget(self.botao_atualizar)
+        self.botao_atualizar.clicked.connect(self.atualizar_modelos)
+        
+        layout_cabecalho.addWidget(QLabel("Host:"))
+        
+        self.entrada_host = QLineEdit(self.api_url)
+        self.entrada_host.setMinimumWidth(150)
+        layout_cabecalho.addWidget(self.entrada_host)
+        
+        self.botao_testar = QPushButton("Testar Conexão")
+        layout_cabecalho.addWidget(self.botao_testar)
+        self.botao_testar.clicked.connect(self.testar_conexao)
+        
+        self.botao_reiniciar = QPushButton("Reiniciar Conexão")
+        layout_cabecalho.addWidget(self.botao_reiniciar)
+        self.botao_reiniciar.clicked.connect(self.reiniciar_conexao)
+        
+        layout_cabecalho.addStretch(1)
+        self.layout_principal.addWidget(frame_cabecalho)
+        
+        # Área de chat
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        
+        self.caixa_chat = QTextEdit()
+        self.caixa_chat.setReadOnly(True)
+        self.caixa_chat.setFont(QFont(self.fonte_padrao, 12))
+        
+        # Configurar estilos CSS
+        self.caixa_chat.document().setDefaultStyleSheet("""
+            h3 {
+                color: #ffcc80;
+                font-weight: bold;
+                margin-top: 10px;
+                margin-bottom: 5px;
+            }
+            b {
+                color: #ffffff;
+                font-weight: bold;
+            }
+        """)
+        
+        scroll_area.setWidget(self.caixa_chat)
+        self.layout_principal.addWidget(scroll_area, 1)
+        
+        # Barra de progresso
+        frame_progresso = QWidget()
+        layout_progresso = QHBoxLayout(frame_progresso)
+        layout_progresso.setContentsMargins(0, 0, 0, 0)
+        
+        self.progresso = QProgressBar()
+        self.progresso.setRange(0, 0)  # Indeterminado
+        self.progresso.setVisible(False)
+        layout_progresso.addWidget(self.progresso)
+        
+        self.botao_parar = QPushButton("Parar")
+        self.botao_parar.setVisible(False)
+        layout_progresso.addWidget(self.botao_parar)
+        self.botao_parar.clicked.connect(lambda: self.botao_parar.setEnabled(False))
+        
+        self.layout_principal.addWidget(frame_progresso)
+        
+        # Entrada de texto
+        frame_entrada = QWidget()
+        layout_entrada = QVBoxLayout(frame_entrada)
+        layout_entrada.setContentsMargins(0, 0, 0, 0)
+        
+        # Usando nossa classe personalizada
+        self.entrada_usuario = EntradaUsuario()
+        self.entrada_usuario.setFont(QFont(self.fonte_padrao, 12))
+        self.entrada_usuario.setMinimumHeight(100)
+        self.entrada_usuario.enterPressed.connect(self.ao_clicar_enviar)
+        layout_entrada.addWidget(self.entrada_usuario)
+        
+        frame_botoes = QWidget()
+        layout_botoes = QHBoxLayout(frame_botoes)
+        layout_botoes.setContentsMargins(0, 10, 0, 0)
+        
+        self.botao_enviar = QPushButton("Enviar")
+        layout_botoes.addWidget(self.botao_enviar)
+        self.botao_enviar.clicked.connect(self.ao_clicar_enviar)
+        self.botao_enviar.setEnabled(False)
+        
+        layout_entrada.addWidget(frame_botoes)
+        self.layout_principal.addWidget(frame_entrada)
+        
+        # Menu
+        self.criar_menu()
+
+    def criar_menu(self):
+        menu_bar = self.menuBar()
+        
+        # Menu Arquivo
+        menu_arquivo = menu_bar.addMenu("Arquivo")
+        acao_gerenciar = QAction("Gerenciar Modelos", self)
+        acao_gerenciar.triggered.connect(self.mostrar_janela_gerenciamento)
+        menu_arquivo.addAction(acao_gerenciar)
+        
+        acao_sair = QAction("Sair", self)
+        acao_sair.triggered.connect(self.close)
+        menu_arquivo.addAction(acao_sair)
+        
+        # Menu Editar
+        menu_editar = menu_bar.addMenu("Editar")
+        acao_copiar_tudo = QAction("Copiar Tudo", self)
+        acao_copiar_tudo.triggered.connect(self.copiar_tudo)
+        menu_editar.addAction(acao_copiar_tudo)
+        
+        acao_limpar_chat = QAction("Limpar Chat", self)
+        acao_limpar_chat.triggered.connect(self.limpar_chat)
+        menu_editar.addAction(acao_limpar_chat)
+        
+        # Menu Ajuda
+        menu_ajuda = menu_bar.addMenu("Ajuda")
+        acao_codigo = QAction("Código Fonte", self)
+        acao_codigo.triggered.connect(self.abrir_pagina_inicial)
+        menu_ajuda.addAction(acao_codigo)
+        
+        acao_ajuda = QAction("Ajuda", self)
+        acao_ajuda.triggered.connect(self.mostrar_ajuda)
+        menu_ajuda.addAction(acao_ajuda)
+        
+        acao_solucionar = QAction("Solucionar Problemas", self)
+        acao_solucionar.triggered.connect(self.mostrar_ajuda_conexao)
+        menu_ajuda.addAction(acao_solucionar)
+
+    def conectar_sinais(self):
+        self.signals.update_chat.connect(self.adicionar_texto_chat)
+        self.signals.update_log.connect(self.adicionar_log)
+        self.signals.show_progress.connect(self.mostrar_barra_progresso)
+        self.signals.hide_progress.connect(self.ocultar_barra_progresso)
+        self.signals.enable_button.connect(self.habilitar_botao)
+        self.signals.update_model_combo.connect(self.atualizar_seletor_modelos_ui)
+        self.signals.show_error.connect(self.mostrar_erro)
+        self.signals.update_model_list.connect(self.atualizar_lista_modelos_ui)
+
+    # Métodos principais (comunicação entre threads via signals)
+    @Slot(str, str)
+    def adicionar_texto_chat(self, texto: str, tipo: str):
+        try:
+            self.caixa_chat.setReadOnly(False)
+            cursor = self.caixa_chat.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            
+            if tipo == "usuario":
+                # Texto do usuário
+                self.caixa_chat.setTextColor(QColor("#e0e0e0"))
+                self.caixa_chat.insertPlainText("Você: " + texto + "\n\n")
+            elif tipo == "modelo":
+                # Texto do modelo - apenas adiciona texto puro
+                self.caixa_chat.setTextColor(QColor("#e0e0e0"))
+                self.caixa_chat.insertPlainText(texto)
+            elif tipo == "nome_modelo":
+                # Nome do modelo
+                self.caixa_chat.setTextColor(QColor("#ffcc80"))
+                self.caixa_chat.insertPlainText("Modelo: " + texto + "\n")
+            elif tipo == "erro":
+                # Mensagens de erro
+                self.caixa_chat.setTextColor(QColor("#ff6666"))
+                self.caixa_chat.insertPlainText(texto + "\n\n")
+            elif tipo == "texto":
+                self.caixa_chat.insertPlainText("\n")
+            
+            cursor.movePosition(QTextCursor.End)
+            self.caixa_chat.setTextCursor(cursor)
+            self.caixa_chat.ensureCursorVisible()
+        except Exception as e:
+            self.adicionar_log(f"Erro ao adicionar texto: {str(e)}")
+        finally:
+            self.caixa_chat.setReadOnly(True)
+
+    @Slot(str, bool)
+    def adicionar_log(self, mensagem: Optional[str] = None, limpar: bool = False):
+        if self.caixa_log is None:
+            return
+            
+        try:
+            self.caixa_log.setReadOnly(False)
+            if limpar:
+                self.caixa_log.clear()
+            elif mensagem:
+                self.caixa_log.append(mensagem)
+            
+            cursor = self.caixa_log.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.caixa_log.setTextCursor(cursor)
+        except Exception as e:
+            print(f"Erro fatal no log: {str(e)}")
+        finally:
+            self.caixa_log.setReadOnly(True)
+
+    @Slot()
+    def mostrar_barra_progresso(self):
+        self.progresso.setVisible(True)
+        self.botao_parar.setVisible(True)
+        self.botao_parar.setEnabled(True)
+
+    @Slot()
+    def ocultar_barra_progresso(self):
+        self.progresso.setVisible(False)
+        self.botao_parar.setVisible(False)
+
+    @Slot(str, bool)
+    def habilitar_botao(self, nome: str, estado: bool):
+        if nome == "enviar":
+            self.botao_enviar.setEnabled(estado)
+        elif nome == "atualizar":
+            self.botao_atualizar.setEnabled(estado)
+        elif nome == "parar":
+            self.botao_parar.setEnabled(estado)
+
+    @Slot(list)
+    def atualizar_seletor_modelos_ui(self, modelos):
+        self.seletor_modelo.clear()
+        self.seletor_modelo.addItems(modelos)
+        if modelos:
+            self.seletor_modelo.setCurrentIndex(0)
+            self.signals.enable_button.emit("enviar", True)
+        else:
+            self.mostrar_erro("Baixe um modelo primeiro!")
+
+    @Slot(str)
+    def mostrar_erro(self, texto):
+        self.seletor_modelo.clear()
+        self.seletor_modelo.addItem(texto)
+        self.seletor_modelo.setStyleSheet("color: #ff6666;")
+        self.signals.enable_button.emit("enviar", False)
+
+    @Slot(list)
+    def atualizar_lista_modelos_ui(self, modelos):
+        if self.lista_modelos is None:
+            return
+            
+        try:
+            self.lista_modelos.clear()
+            self.lista_modelos.addItems(modelos)
+        except Exception as e:
+            self.adicionar_log(f"Erro na lista: {str(e)}")
+
+    # Métodos de funcionalidade
+    def atualizar_modelos(self):
+        self.atualizar_host()
+        self.seletor_modelo.setStyleSheet("")
+        self.signals.enable_button.emit("enviar", False)
+        self.signals.enable_button.emit("atualizar", False)
+        Thread(target=self.atualizar_seletor_modelos, daemon=True).start()
+
+    def atualizar_host(self):
+        url = self.entrada_host.text().strip()
+        if not url.startswith(('http://', 'https://')):
+            url = 'http://' + url
+        self.api_url = url
+
+    def atualizar_seletor_modelos(self):
+        try:
+            modelos = self.buscar_modelos()
+            self.signals.update_model_combo.emit(modelos)
+        except ModeloNaoEncontradoError:
+            self.signals.show_error.emit("Nenhum modelo encontrado!")
+        except ErroConexaoError as e:
+            self.signals.show_error.emit(f"Erro de conexão: {str(e)}")
+        except ErroServidorError as e:
+            self.signals.show_error.emit(f"Erro no servidor: {str(e)}")
+        except Exception as e:
+            self.signals.show_error.emit(f"Erro inesperado: {type(e).__name__}")
+        finally:
+            self.signals.enable_button.emit("atualizar", True)
+
+    def ao_clicar_enviar(self):
+        try:
+            mensagem = self.entrada_usuario.toPlainText().strip()
+            if not mensagem:
+                return
+                
+            self.signals.update_chat.emit(mensagem, "usuario")
+            self.entrada_usuario.clear()
+            self.historico_chat.append({"role": "user", "content": mensagem})
+
+            Thread(target=self.gerar_resposta_ia, daemon=True).start()
+        except Exception as e:
+            self.adicionar_log(f"Erro ao enviar: {str(e)}")
+
+    def gerar_resposta_ia(self):
+        self.signals.show_progress.emit()
+        self.signals.enable_button.emit("enviar", False)
+        self.signals.enable_button.emit("atualizar", False)
+        self.signals.enable_button.emit("parar", True)
+
+        try:
+            modelo = self.seletor_modelo.currentText()
+            self.signals.update_chat.emit(modelo, "nome_modelo")
+            
+            mensagem_ia = ""
+            for parte in self.buscar_resposta_chat_stream():
+                if not self.botao_parar.isEnabled():
+                    break
+                    
+                # Adicionar parte normalmente
+                self.signals.update_chat.emit(parte, "modelo")
+                mensagem_ia += parte
+                
+            self.historico_chat.append({"role": "assistant", "content": mensagem_ia})
+            self.signals.update_chat.emit("\n", "texto")
+            
+            # Aplicar formatação apenas na resposta completa
+            cursor = self.caixa_chat.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            cursor.select(QTextCursor.BlockUnderCursor)
+            texto_formatado = formatar_markdown(mensagem_ia)
+            cursor.insertHtml(texto_formatado)
+            
+        except socket.timeout:
+            erro = "Tempo esgotado: A resposta demorou muito"
+            self.signals.update_chat.emit(erro, "erro")
+            self.signals.update_chat.emit("\n", "texto")
+        except urllib.error.URLError as e:
+            erro = f"Erro de conexão: {e.reason}"
+            self.signals.update_chat.emit(erro, "erro")
+            self.signals.update_chat.emit("\n", "texto")
+        except urllib.error.HTTPError as e:
+            if e.code == 500:
+                erro = "Erro interno no servidor Ollama (500)\n"
+                erro += "Possíveis causas:\n"
+                erro += "• O modelo pode estar corrompido\n"
+                erro += "• Falta de memória no servidor\n"
+                erro += "• Bug no servidor Ollama\n\n"
+                erro += "Soluções sugeridas:\n"
+                erro += "1. Reinicie o servidor Ollama\n"
+                erro += "2. Tente outro modelo\n"
+                erro += "3. Verifique os logs do servidor"
+            else:
+                erro = f"Erro HTTP {e.code}: {e.reason}"
+            self.signals.update_chat.emit(erro, "erro")
+            self.signals.update_chat.emit("\n", "texto")
+        except json.JSONDecodeError:
+            erro = "Resposta inválida do servidor"
+            self.signals.update_chat.emit(erro, "erro")
+            self.signals.update_chat.emit("\n", "texto")
+        except ModeloNaoEncontradoError:
+            erro = "Modelo não encontrado"
+            self.signals.update_chat.emit(erro, "erro")
+            self.signals.update_chat.emit("\n", "texto")
+        except ErroConexaoError as e:
+            erro = f"Falha na conexão: {str(e)}"
+            self.signals.update_chat.emit(erro, "erro")
+            self.signals.update_chat.emit("\n", "texto")
+        except ErroServidorError as e:
+            erro = f"Erro no servidor: {str(e)}"
+            self.signals.update_chat.emit(erro, "erro")
+            self.signals.update_chat.emit("\n", "texto")
+        except Exception as e:
+            erro = f"Erro inesperado: {type(e).__name__}"
+            self.signals.update_chat.emit(erro, "erro")
+            self.signals.update_chat.emit("\n", "texto")
+        finally:
+            self.signals.hide_progress.emit()
+            self.signals.enable_button.emit("enviar", True)
+            self.signals.enable_button.emit("atualizar", True)
+            self.signals.enable_button.emit("parar", True)
+
+    def buscar_modelos(self) -> List[str]:
+        url = urllib.parse.urljoin(self.api_url, "/api/tags")
+        try:
+            with urllib.request.urlopen(url, timeout=TIMEOUT_CONEXAO) as resposta:
+                if resposta.status != 200:
+                    raise ErroServidorError(f"Status HTTP inesperado: {resposta.status}")
+                
+                dados = json.load(resposta)
+                if "models" not in dados:
+                    raise ModeloNaoEncontradoError("Nenhum modelo disponível")
+                    
+                modelos = [modelo["name"] for modelo in dados["models"]]
+                return modelos
+        except urllib.error.HTTPError as e:
+            if e.code == 500:
+                raise ErroServidorError("Erro interno no servidor Ollama (500)") from e
+            else:
+                raise ErroConexaoError(f"Erro HTTP {e.code}: {e.reason}") from e
+        except urllib.error.URLError as e:
+            raise ErroConexaoError(f"Falha ao conectar com o servidor: {e.reason}") from e
+        except socket.timeout:
+            raise ErroConexaoError("Tempo de conexão esgotado") from None
+        except json.JSONDecodeError:
+            raise ErroServidorError("Resposta inválida do servidor") from None
+        except Exception as e:
+            raise ErroConexaoError(f"Erro inesperado: {str(e)}") from e
+
+    def buscar_resposta_chat_stream(self) -> Generator:
+        url = urllib.parse.urljoin(self.api_url, "/api/chat")
+        dados = json.dumps(
+            {
+                "model": self.seletor_modelo.currentText(),
+                "messages": self.historico_chat,
+                "stream": True,
+            }
+        ).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+
+        req = urllib.request.Request(url, data=dados, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT_CONVERSA) as resp:
+                if resp.status != 200:
+                    raise ErroServidorError(f"Status HTTP inesperado: {resp.status}")
+                
+                for linha in resp:
+                    if not self.botao_parar.isEnabled():  # parar
+                        break
+                    dados = json.loads(linha.decode("utf-8"))
+                    if "message" in dados:
+                        time.sleep(0.01)
+                        yield dados["message"]["content"]
+        except urllib.error.HTTPError as e:
+            if e.code == 500:
+                raise ErroServidorError("Erro interno no servidor durante a conversa") from e
+            else:
+                raise ErroConexaoError(f"Erro HTTP {e.code}: {e.reason}") from e
+        except urllib.error.URLError as e:
+            raise ErroConexaoError(f"Erro durante a conversa: {e.reason}") from e
+        except socket.timeout:
+            raise ErroConexaoError("Tempo de resposta esgotado") from None
+        except json.JSONDecodeError:
+            raise ErroServidorError("Resposta inválida do servidor") from None
+        except Exception as e:
+            raise ErroConexaoError(f"Erro inesperado: {str(e)}") from e
+
+    # Outros métodos
+    def copiar_texto(self, texto: str):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(texto)
+
+    def copiar_tudo(self):
+        self.copiar_texto(pprint.pformat(self.historico_chat))
+
+    def abrir_pagina_inicial(self):
+        webbrowser.open("https://github.com/wendellmoura/ollama-gui")
+
+    def mostrar_ajuda(self):
+        info = ("Projeto: Ollama GUI\n"
+                f"Versão: {__version__}\n"
+                "Autor: Wendell Moura\n"
+                "Github: https://github.com/wendellmoura/ollama-gui\n\n"
+                "<Enter>: enviar\n"
+                "<Shift+Enter>: nova linha")
+        QMessageBox.information(self, "Sobre", info)
+
+    def verificar_sistema(self):
+        # Implementação simplificada para PySide
+        if platform.system().lower() == "darwin":
+            versao = platform.mac_ver()[0]
+            if versao and 14 <= float(versao) < 15:
+                QMessageBox.warning(
+                    self, 
+                    "Aviso",
+                    "Aviso: Problema de Responsividade Detectado\n\n"
+                    "Você pode experimentar elementos de interface congelados quando "
+                    "o cursor está dentro da janela durante a inicialização. "
+                    "Este é um problema conhecido com versões do macOS Sonoma.\n\n"
+                    "Solução temporária: Mova o cursor para fora da "
+                    "janela e retorne se os elementos travarem."
                 )
 
+    def limpar_chat(self):
+        try:
+            self.caixa_chat.clear()
+            self.historico_chat.clear()
+            self.ultima_resposta = ""
+        except Exception as e:
+            self.adicionar_log(f"Erro ao limpar chat: {str(e)}")
 
-class OllamaInterface:
-    chat_box: tk.Text
-    user_input: tk.Text
-    host_input: ttk.Entry
-    progress: ttk.Progressbar
-    stop_button: ttk.Button
-    send_button: ttk.Button
-    refresh_button: ttk.Button
-    download_button: ttk.Button
-    delete_button: ttk.Button
-    model_select: ttk.Combobox
-    log_textbox: tk.Text
-    models_list: tk.Listbox
-
-    def __init__(self, root: tk.Tk):
-        self.root: tk.Tk = root
-        self.api_url: str = "http://127.0.0.1:11434"
-        self.chat_history: List[dict] = []
-        self.label_widgets: List[tk.Label] = []
-        self.default_font: str = font.nametofont("TkTextFont").actual()["family"]
-
-        self.layout = LayoutManager(self)
-        self.layout.init_layout()
-
-        self.root.after(200, self.check_system)
-        self.refresh_models()
-
-    def copy_text(self, text: str):
-        if text:
-            self.chat_box.clipboard_clear()
-            self.chat_box.clipboard_append(text)
-
-    def copy_all(self):
-        self.copy_text(pprint.pformat(self.chat_history))
-
-    @staticmethod
-    def open_homepage():
-        webbrowser.open("https://github.com/chyok/ollama-gui")
-
-    def show_help(self):
-        info = ("Project: Ollama GUI\n"
-                f"Version: {__version__}\n"
-                "Author: chyok\n"
-                "Github: https://github.com/chyok/ollama-gui\n\n"
-                "<Enter>: send\n"
-                "<Shift+Enter>: new line\n"
-                "<Double click dialog>: edit dialog\n")
-        messagebox.showinfo("About", info, parent=self.root)
-
-    def check_system(self):
-        message = _system_check(self.root)
-        if message is not None:
-            messagebox.showwarning("Warning", message, parent=self.root)
-
-    def append_text_to_chat(self,
-                            text: str,
-                            *args,
-                            use_label: bool = False):
-        self.chat_box.config(state=tk.NORMAL)
-        if use_label:
-            cur_label_widget = self.label_widgets[-1]
-            cur_label_widget.config(text=cur_label_widget.cget("text") + text)
+    def testar_conexao(self):
+        self.atualizar_host()
+        if self.verificar_conexao():
+            QMessageBox.information(
+                self,
+                "Conexão",
+                f"Conexão com o servidor Ollama bem-sucedida!\nHost: {self.api_url}"
+            )
         else:
-            self.chat_box.insert(tk.END, text, *args)
-        self.chat_box.see(tk.END)
-        self.chat_box.config(state=tk.DISABLED)
+            QMessageBox.critical(
+                self,
+                "Erro de Conexão",
+                "Não foi possível conectar ao servidor Ollama.\n\n"
+                f"Host: {self.api_url}\n\n"
+                "Verifique:\n"
+                "1. Se o servidor Ollama está rodando\n"
+                "2. Se o host e porta estão corretos\n"
+                "3. Sua conexão de rede"
+            )
 
-    def append_log_to_inner_textbox(self,
-                                    message: Optional[str] = None,
-                                    clear: bool = False):
-        if self.log_textbox.winfo_exists():
-            self.log_textbox.config(state=tk.NORMAL)
-            if clear:
-                self.log_textbox.delete(1.0, tk.END)
-            elif message:
-                self.log_textbox.insert(tk.END, message + "\n")
-            self.log_textbox.config(state=tk.DISABLED)
-            self.log_textbox.see(tk.END)
-
-    def resize_inner_text_widget(self, event: tk.Event):
-        for i in self.label_widgets:
-            current_width = event.widget.winfo_width()
-            max_width = int(current_width) * 0.7
-            i.config(wraplength=max_width)
-
-    def show_error(self, text):
-        self.model_select.set(text)
-        self.model_select.config(foreground="red")
-        self.model_select["values"] = []
-        self.send_button.state(["disabled"])
-
-    def show_process_bar(self):
-        self.progress.grid(row=0, column=0, sticky="nsew")
-        self.stop_button.grid(row=0, column=1, padx=20)
-        self.progress.start(5)
-
-    def hide_process_bar(self):
-        self.progress.stop()
-        self.stop_button.grid_remove()
-        self.progress.grid_remove()
-
-    def handle_key_press(self, event: tk.Event):
-        if event.keysym == "Return":
-            if event.state & 0x1 == 0x1:  # Shift key is pressed
-                self.user_input.insert("end", "\n")
-            elif "disabled" not in self.send_button.state():
-                self.on_send_button(event)
-            return "break"
-
-    def refresh_models(self):
-        self.update_host()
-        self.model_select.config(foreground="black")
-        self.model_select.set("Waiting...")
-        self.send_button.state(["disabled"])
-        self.refresh_button.state(["disabled"])
-        Thread(target=self.update_model_select, daemon=True).start()
-
-    def update_host(self):
-        self.api_url = self.host_input.get()
-
-    def update_model_select(self):
+    def verificar_conexao(self) -> bool:
         try:
-            models = self.fetch_models()
-            self.model_select["values"] = models
-            if models:
-                self.model_select.set(models[0])
-                self.send_button.state(["!disabled"])
-            else:
-                self.show_error("You need download a model!")
-        except Exception:  # noqa
-            self.show_error("Error! Please check the host.")
-        finally:
-            self.refresh_button.state(["!disabled"])
+            with urllib.request.urlopen(
+                urllib.parse.urljoin(self.api_url, "/api/tags"), 
+                timeout=5
+            ) as resposta:
+                return resposta.status == 200
+        except:
+            return False
 
-    def update_model_list(self):
-        if self.models_list.winfo_exists():
-            self.models_list.delete(0, tk.END)
-            try:
-                models = self.fetch_models()
-                for model in models:
-                    self.models_list.insert(tk.END, model)
-            except Exception:  # noqa
-                self.append_log_to_inner_textbox("Error! Please check the Ollama host.")
+    def reiniciar_conexao(self):
+        self.atualizar_host()
+        self.atualizar_modelos()
+        self.adicionar_log("Conexão reiniciada com o servidor Ollama")
 
-    def on_send_button(self, _=None):
-        message = self.user_input.get("1.0", "end-1c")
-        if message:
-            self.layout.create_inner_label(on_right_side=True)
-            self.append_text_to_chat(f"{message}", use_label=True)
-            self.append_text_to_chat(f"\n\n")
-            self.user_input.delete("1.0", "end")
-            self.chat_history.append({"role": "user", "content": message})
-
-            Thread(
-                target=self.generate_ai_response,
-                daemon=True,
-            ).start()
-
-    def generate_ai_response(self):
-        self.show_process_bar()
-        self.send_button.state(["disabled"])
-        self.refresh_button.state(["disabled"])
-
-        try:
-            self.append_text_to_chat(f"{self.model_select.get()}\n", ("Bold",))
-            ai_message = ""
-            self.layout.create_inner_label()
-            for i in self.fetch_chat_stream_result():
-                self.append_text_to_chat(f"{i}", use_label=True)
-                ai_message += i
-            self.chat_history.append({"role": "assistant", "content": ai_message})
-            self.append_text_to_chat("\n\n")
-        except Exception:  # noqa
-            self.append_text_to_chat(tk.END, f"\nAI error!\n\n", ("Error",))
-        finally:
-            self.hide_process_bar()
-            self.send_button.state(["!disabled"])
-            self.refresh_button.state(["!disabled"])
-            self.stop_button.state(["!disabled"])
-
-    def fetch_models(self) -> List[str]:
-        with urllib.request.urlopen(
-                urllib.parse.urljoin(self.api_url, "/api/tags")
-        ) as response:
-            data = json.load(response)
-            models = [model["name"] for model in data["models"]]
-            return models
-
-    def fetch_chat_stream_result(self) -> Generator:
-        request = urllib.request.Request(
-            urllib.parse.urljoin(self.api_url, "/api/chat"),
-            data=json.dumps(
-                {
-                    "model": self.model_select.get(),
-                    "messages": self.chat_history,
-                    "stream": True,
-                }
-            ).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+    def mostrar_ajuda_conexao(self):
+        ajuda = (
+            "Solução de Problemas de Conexão\n\n"
+            "1. Verifique se o servidor Ollama está rodando:\n"
+            "   • Execute 'ollama serve' no terminal\n\n"
+            "2. Confira o host e porta:\n"
+            "   • Padrão: http://127.0.0.1:11434\n\n"
+            "3. Teste a conexão usando o botão 'Testar Conexão'\n\n"
+            "4. Se estiver usando Docker, verifique as portas expostas\n\n"
+            "5. Reinicie o servidor Ollama e a aplicação"
         )
+        QMessageBox.information(self, "Ajuda de Conexão", ajuda)
 
-        with urllib.request.urlopen(request) as resp:
-            for line in resp:
-                if "disabled" in self.stop_button.state():  # stop
-                    break
-                data = json.loads(line.decode("utf-8"))
-                if "message" in data:
-                    time.sleep(0.01)
-                    yield data["message"]["content"]
-
-    def delete_model(self, model_name: str):
-        self.append_log_to_inner_textbox(clear=True)
-        if not model_name:
+    def mostrar_janela_gerenciamento(self):
+        if hasattr(self, 'janela_gerenciamento') and self.janela_gerenciamento.isVisible():
+            self.janela_gerenciamento.activateWindow()
             return
 
-        req = urllib.request.Request(
-            urllib.parse.urljoin(self.api_url, "/api/delete"),
-            data=json.dumps({"name": model_name}).encode("utf-8"),
-            method="DELETE",
-        )
-        try:
-            with urllib.request.urlopen(req) as response:
-                if response.status == 200:
-                    self.append_log_to_inner_textbox("Model deleted successfully.")
-                elif response.status == 404:
-                    self.append_log_to_inner_textbox("Model not found.")
-        except Exception as e:
-            self.append_log_to_inner_textbox(f"Failed to delete model: {e}")
-        finally:
-            self.update_model_list()
-            self.update_model_select()
+        self.janela_gerenciamento = JanelaGerenciamento(self)
+        self.janela_gerenciamento.show()
 
-    def download_model(self, model_name: str, insecure: bool = False):
-        self.append_log_to_inner_textbox(clear=True)
-        if not model_name:
+    # Métodos para gerenciamento de modelos
+    def baixar_modelo(self, nome_modelo: str, insecure: bool = False):
+        self.signals.update_log.emit("", True)  # Limpar log
+        if not nome_modelo:
             return
 
-        self.download_button.state(["disabled"])
-
-        req = urllib.request.Request(
-            urllib.parse.urljoin(self.api_url, "/api/pull"),
-            data=json.dumps(
-                {"name": model_name, "insecure": insecure, "stream": True}
-            ).encode("utf-8"),
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(req) as response:
-                for line in response:
-                    data = json.loads(line.decode("utf-8"))
-                    log = data.get("error") or data.get("status") or "No response"
-                    if "status" in data:
-                        total = data.get("total")
-                        completed = data.get("completed", 0)
+            url = urllib.parse.urljoin(self.api_url, "/api/pull")
+            dados = json.dumps({"name": nome_modelo, "insecure": insecure, "stream": True}).encode("utf-8")
+            req = urllib.request.Request(url, data=dados, method="POST")
+            
+            with urllib.request.urlopen(req, timeout=TIMEOUT_DOWNLOAD) as resposta:
+                for linha in resposta:
+                    dados = json.loads(linha.decode("utf-8"))
+                    log = dados.get("error") or dados.get("status") or "Sem resposta"
+                    if "status" in dados:
+                        total = dados.get("total")
+                        completado = dados.get("completed", 0)
                         if total:
-                            log += f" [{completed}/{total}]"
-                    self.append_log_to_inner_textbox(log)
+                            log += f" [{completado}/{total}]"
+                    self.signals.update_log.emit(log, False)
         except Exception as e:
-            self.append_log_to_inner_textbox(f"Failed to download model: {e}")
+            self.signals.update_log.emit(f"Falha no download: {str(e)}", False)
         finally:
-            self.update_model_list()
-            self.update_model_select()
-            if self.download_button.winfo_exists():
-                self.download_button.state(["!disabled"])
+            self.signals.update_model_list.emit(self.buscar_modelos())
+            self.signals.update_model_combo.emit(self.buscar_modelos())
+            self.signals.enable_button.emit("baixar", True)
 
-    def clear_chat(self):
-        for i in self.label_widgets:
-            i.destroy()
-        self.label_widgets.clear()
-        self.chat_box.config(state=tk.NORMAL)
-        self.chat_box.delete(1.0, tk.END)
-        self.chat_box.config(state=tk.DISABLED)
-        self.chat_history.clear()
-
-
-class LayoutManager:
-    """
-    Manages the layout and arrangement of the OllamaInterface.
-
-    The LayoutManager is responsible for the visual organization and positioning
-    of the various components within the OllamaInterface, such as the header,
-    chat container, progress bar, and input fields. It handles the sizing,
-    spacing, and alignment of these elements to create a cohesive and
-    user-friendly layout.
-    """
-
-    def __init__(self, interface: OllamaInterface):
-        self.interface: OllamaInterface = interface
-        self.management_window: Optional[tk.Toplevel] = None
-        self.editor_window: Optional[tk.Toplevel] = None
-
-    def init_layout(self):
-        self._header_frame()
-        self._chat_container_frame()
-        self._processbar_frame()
-        self._input_frame()
-
-    def _header_frame(self):
-        header_frame = ttk.Frame(self.interface.root)
-        header_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=20)
-        header_frame.grid_columnconfigure(3, weight=1)
-
-        model_select = ttk.Combobox(header_frame, state="readonly", width=30)
-        model_select.grid(row=0, column=0)
-
-        settings_button = ttk.Button(
-            header_frame, text="⚙️", command=self.show_model_management_window, width=3
-        )
-        settings_button.grid(row=0, column=1, padx=(5, 0))
-
-        refresh_button = ttk.Button(header_frame, text="Refresh", command=self.interface.refresh_models)
-        refresh_button.grid(row=0, column=2, padx=(5, 0))
-
-        ttk.Label(header_frame, text="Host:").grid(row=0, column=4, padx=(10, 0))
-
-        host_input = ttk.Entry(header_frame, width=24)
-        host_input.grid(row=0, column=5, padx=(5, 15))
-        host_input.insert(0, self.interface.api_url)
-
-        self.interface.model_select = model_select
-        self.interface.refresh_button = refresh_button
-        self.interface.host_input = host_input
-
-    def _chat_container_frame(self):
-        chat_frame = ttk.Frame(self.interface.root)
-        chat_frame.grid(row=1, column=0, sticky="nsew", padx=20)
-        chat_frame.grid_columnconfigure(0, weight=1)
-        chat_frame.grid_rowconfigure(0, weight=1)
-
-        chat_box = tk.Text(
-            chat_frame,
-            wrap=tk.WORD,
-            state=tk.DISABLED,
-            font=(self.interface.default_font, 12),
-            spacing1=5,
-            highlightthickness=0,
-        )
-        chat_box.grid(row=0, column=0, sticky="nsew")
-
-        scrollbar = ttk.Scrollbar(chat_frame, orient="vertical", command=chat_box.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-
-        chat_box.configure(yscrollcommand=scrollbar.set)
-
-        chat_box_menu = tk.Menu(chat_box, tearoff=0)
-        chat_box_menu.add_command(label="Copy All", command=self.interface.copy_all)
-        chat_box_menu.add_separator()
-        chat_box_menu.add_command(label="Clear Chat", command=self.interface.clear_chat)
-        chat_box.bind("<Configure>", self.interface.resize_inner_text_widget)
-
-        _right_click = (
-            "<Button-2>" if platform.system().lower() == "darwin" else "<Button-3>"
-        )
-        chat_box.bind(_right_click, lambda e: chat_box_menu.post(e.x_root, e.y_root))
-
-        self.interface.chat_box = chat_box
-
-    def _processbar_frame(self):
-        process_frame = ttk.Frame(self.interface.root, height=28)
-        process_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=10)
-
-        progress = ttk.Progressbar(
-            process_frame,
-            mode="indeterminate",
-            style="LoadingBar.Horizontal.TProgressbar",
-        )
-
-        stop_button = ttk.Button(
-            process_frame,
-            width=5,
-            text="Stop",
-            command=lambda: stop_button.state(["disabled"]),
-        )
-
-        self.interface.progress = progress
-        self.interface.stop_button = stop_button
-
-    def _input_frame(self):
-        input_frame = ttk.Frame(self.interface.root)
-        input_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 20))
-        input_frame.grid_columnconfigure(0, weight=1)
-
-        user_input = tk.Text(
-            input_frame, font=(self.interface.default_font, 12), height=4, wrap=tk.WORD
-        )
-        user_input.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        user_input.bind("<Key>", self.interface.handle_key_press)
-
-        send_button = ttk.Button(
-            input_frame,
-            text="Send",
-            command=self.interface.on_send_button,
-        )
-        send_button.grid(row=0, column=1)
-        send_button.state(["disabled"])
-
-        menubar = tk.Menu(self.interface.root)
-        self.interface.root.config(menu=menubar)
-
-        file_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="Model Management", command=self.show_model_management_window)
-        file_menu.add_command(label="Exit", command=self.interface.root.quit)
-
-        edit_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Edit", menu=edit_menu)
-        edit_menu.add_command(label="Copy All", command=self.interface.copy_all)
-        edit_menu.add_command(label="Clear Chat", command=self.interface.clear_chat)
-
-        help_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="Source Code", command=self.interface.open_homepage)
-        help_menu.add_command(label="Help", command=self.interface.show_help)
-
-        self.interface.user_input = user_input
-        self.interface.send_button = send_button
-
-    def show_model_management_window(self):
-        self.interface.update_host()
-
-        if self.management_window and self.management_window.winfo_exists():
-            self.management_window.lift()
+    def excluir_modelo(self, nome_modelo: str):
+        self.signals.update_log.emit("", True)  # Limpar log
+        if not nome_modelo:
             return
 
-        management_window = tk.Toplevel(self.interface.root)
-        management_window.title("Model Management")
-        screen_width = self.interface.root.winfo_screenwidth()
-        screen_height = self.interface.root.winfo_screenheight()
-        x = int((screen_width / 2) - (400 / 2))
-        y = int((screen_height / 2) - (500 / 2))
+        try:
+            url = urllib.parse.urljoin(self.api_url, "/api/delete")
+            dados = json.dumps({"name": nome_modelo}).encode("utf-8")
+            req = urllib.request.Request(url, data=dados, method="DELETE")
+            
+            with urllib.request.urlopen(req, timeout=TIMEOUT_CONEXAO) as resposta:
+                if resposta.status == 200:
+                    self.signals.update_log.emit("Modelo excluído com sucesso.", False)
+                elif resposta.status == 404:
+                    self.signals.update_log.emit("Modelo não encontrado.", False)
+                else:
+                    self.signals.update_log.emit(f"Resposta inesperada do servidor: {resposta.status}", False)
+        except Exception as e:
+            self.signals.update_log.emit(f"Falha ao excluir modelo: {str(e)}", False)
+        finally:
+            self.signals.update_model_list.emit(self.buscar_modelos())
+            self.signals.update_model_combo.emit(self.buscar_modelos())
 
-        management_window.geometry(f"{400}x{500}+{x}+{y}")
 
-        management_window.grid_columnconfigure(0, weight=1)
-        management_window.grid_rowconfigure(3, weight=1)
-
-        frame = ttk.Frame(management_window)
-        frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
-        frame.grid_columnconfigure(0, weight=1)
-
-        model_name_input = ttk.Entry(frame)
-        model_name_input.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-
-        def _download():
-            arg = model_name_input.get().strip()
-            if arg.startswith("ollama run "):
-                arg = arg[11:]
-            Thread(
-                target=self.interface.download_model, daemon=True, args=(arg,)
-            ).start()
-
-        def _delete():
-            arg = models_list.get(tk.ACTIVE).strip()
-            Thread(target=self.interface.delete_model, daemon=True, args=(arg,)).start()
-
-        download_button = ttk.Button(frame, text="Download", command=_download)
-        download_button.grid(row=0, column=1, sticky="ew")
-
-        tips = tk.Label(
-            frame,
-            text="find models: https://ollama.com/library",
-            fg="blue",
-            cursor="hand2",
+class JanelaGerenciamento(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.setWindowTitle("Gerenciamento de Modelos")
+        self.resize(400, 500)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Entrada para nome do modelo
+        frame_entrada = QWidget()
+        layout_entrada = QHBoxLayout(frame_entrada)
+        layout_entrada.setContentsMargins(0, 0, 0, 0)
+        
+        self.entrada_nome_modelo = QLineEdit()
+        layout_entrada.addWidget(self.entrada_nome_modelo)
+        
+        self.botao_baixar = QPushButton("Baixar")
+        layout_entrada.addWidget(self.botao_baixar)
+        self.botao_baixar.clicked.connect(self.baixar_modelo)
+        
+        layout.addWidget(frame_entrada)
+        
+        # Link para biblioteca
+        link = QLabel(
+            '<a href="https://ollama.com/library" style="color: #80cbc4; text-decoration: underline;">'
+            'encontrar modelos: https://ollama.com/library</a>'
         )
-        tips.bind("<Button-1>", lambda e: webbrowser.open("https://ollama.com/library"))
-        tips.grid(row=1, column=0, sticky="W", padx=(0, 5), pady=5)
+        link.setOpenExternalLinks(True)
+        layout.addWidget(link)
+        
+        # Lista de modelos
+        frame_lista = QWidget()
+        layout_lista = QHBoxLayout(frame_lista)
+        layout_lista.setContentsMargins(0, 0, 0, 0)
+        
+        self.lista_modelos = QListWidget()
+        layout_lista.addWidget(self.lista_modelos, 1)
+        
+        self.botao_excluir = QPushButton("Excluir")
+        self.botao_excluir.setFixedWidth(80)
+        layout_lista.addWidget(self.botao_excluir)
+        self.botao_excluir.clicked.connect(self.excluir_modelo)
+        
+        layout.addWidget(frame_lista, 1)
+        
+        # Área de log
+        self.caixa_log = QTextEdit()
+        self.caixa_log.setReadOnly(True)
+        layout.addWidget(self.caixa_log)
+        
+        # Conectar sinais do pai
+        self.parent.signals.update_log.connect(self.adicionar_log)
+        self.parent.signals.update_model_list.connect(self.atualizar_lista_modelos_ui)
+        
+        # Carregar modelos iniciais
+        Thread(target=self.carregar_modelos_iniciais, daemon=True).start()
 
-        list_action_frame = ttk.Frame(management_window)
-        list_action_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
-        list_action_frame.grid_columnconfigure(0, weight=1)
-        list_action_frame.grid_rowconfigure(0, weight=1)
+    def carregar_modelos_iniciais(self):
+        try:
+            modelos = self.parent.buscar_modelos()
+            self.parent.signals.update_model_list.emit(modelos)
+        except Exception as e:
+            self.parent.adicionar_log(f"Erro ao carregar modelos: {str(e)}")
 
-        models_list = tk.Listbox(list_action_frame)
-        models_list.grid(row=0, column=0, sticky="nsew")
+    @Slot(str, bool)
+    def adicionar_log(self, mensagem: Optional[str] = None, limpar: bool = False):
+        if limpar:
+            self.caixa_log.clear()
+        if mensagem:
+            self.caixa_log.append(mensagem)
 
-        scrollbar = ttk.Scrollbar(
-            list_action_frame, orient="vertical", command=models_list.yview
-        )
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        models_list.config(yscrollcommand=scrollbar.set)
+    @Slot(list)
+    def atualizar_lista_modelos_ui(self, modelos):
+        self.lista_modelos.clear()
+        self.lista_modelos.addItems(modelos)
 
-        delete_button = ttk.Button(list_action_frame, text="Delete", command=_delete)
-        delete_button.grid(row=0, column=2, sticky="ew", padx=(5, 0))
-
-        log_textbox = tk.Text(management_window)
-        log_textbox.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
-        log_textbox.config(state="disabled")
-
-        self.management_window = management_window
-
-        self.interface.log_textbox = log_textbox
-        self.interface.download_button = download_button
-        self.interface.delete_button = delete_button
-        self.interface.models_list = models_list
+    def baixar_modelo(self):
+        modelo = self.entrada_nome_modelo.text().strip()
+        if modelo.startswith("ollama run "):
+            modelo = modelo[11:]
+            
+        self.parent.signals.update_log.emit("", True)  # Limpar log
+        self.botao_baixar.setEnabled(False)
         Thread(
-            target=self.interface.update_model_list, daemon=True,
+            target=self.parent.baixar_modelo,
+            daemon=True,
+            args=(modelo,)
         ).start()
 
-    def show_editor_window(self, _, inner_label):
-        if self.editor_window and self.editor_window.winfo_exists():
-            self.editor_window.lift()
+    def excluir_modelo(self):
+        item = self.lista_modelos.currentItem()
+        if not item:
             return
-
-        editor_window = tk.Toplevel(self.interface.root)
-        editor_window.title("Chat Editor")
-
-        screen_width = self.interface.root.winfo_screenwidth()
-        screen_height = self.interface.root.winfo_screenheight()
-
-        x = int((screen_width / 2) - (400 / 2))
-        y = int((screen_height / 2) - (300 / 2))
-
-        editor_window.geometry(f"{400}x{300}+{x}+{y}")
-
-        chat_editor = tk.Text(editor_window)
-        chat_editor.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
-        chat_editor.insert(tk.END, inner_label.cget("text"))
-
-        editor_window.grid_rowconfigure(0, weight=1)
-        editor_window.grid_columnconfigure(0, weight=1)
-        editor_window.grid_columnconfigure(1, weight=1)
-
-        def _save():
-            idx = self.interface.label_widgets.index(inner_label)
-            if len(self.interface.chat_history) > idx:
-                self.interface.chat_history[idx]["content"] = chat_editor.get("1.0", "end-1c")
-                inner_label.config(text=chat_editor.get("1.0", "end-1c"))
-
-            editor_window.destroy()
-
-        save_button = tk.Button(editor_window, text="Save", command=_save)
-        save_button.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
-
-        cancel_button = tk.Button(
-            editor_window, text="Cancel", command=editor_window.destroy
-        )
-        cancel_button.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
-
-        editor_window.grid_columnconfigure(0, weight=1, uniform="btn")
-        editor_window.grid_columnconfigure(1, weight=1, uniform="btn")
-
-        self.editor_window = editor_window
-
-    def create_inner_label(self, on_right_side: bool = False):
-        background = "#48a4f2" if on_right_side else "#eaeaea"
-        foreground = "white" if on_right_side else "black"
-        max_width = int(self.interface.chat_box.winfo_reqwidth()) * 0.7
-        inner_label = tk.Label(
-            self.interface.chat_box,
-            justify=tk.LEFT,
-            wraplength=max_width,
-            background=background,
-            highlightthickness=0,
-            highlightbackground=background,
-            foreground=foreground,
-            padx=8,
-            pady=8,
-            font=(self.interface.default_font, 12),
-            borderwidth=0,
-        )
-        self.interface.label_widgets.append(inner_label)
-
-        inner_label.bind(
-            "<MouseWheel>",
-            lambda e:
-            self.interface.chat_box.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        )
-        inner_label.bind("<Double-1>", lambda e: self.show_editor_window(e, inner_label))
-
-        _right_menu = tk.Menu(inner_label, tearoff=0)
-        _right_menu.add_command(
-            label="Edit", command=lambda: self.show_editor_window(None, inner_label)
-        )
-        _right_menu.add_command(
-            label="Copy This", command=lambda: self.interface.copy_text(inner_label.cget("text"))
-        )
-        _right_menu.add_separator()
-        _right_menu.add_command(label="Clear Chat", command=self.interface.clear_chat)
-        _right_click = (
-            "<Button-2>" if platform.system().lower() == "darwin" else "<Button-3>"
-        )
-        inner_label.bind(_right_click, lambda e: _right_menu.post(e.x_root, e.y_root))
-        self.interface.chat_box.window_create(tk.END, window=inner_label)
-        if on_right_side:
-            idx = self.interface.chat_box.index("end-1c").split(".")[0]
-            self.interface.chat_box.tag_add("Right", f"{idx}.0", f"{idx}.end")
+            
+        modelo = item.text()
+        Thread(
+            target=self.parent.excluir_modelo,
+            daemon=True,
+            args=(modelo,)
+        ).start()
 
 
-def run():
-    root = tk.Tk()
-
-    root.title("Ollama GUI")
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    root.geometry(f"800x600+{(screen_width - 800) // 2}+{(screen_height - 600) // 2}")
-
-    root.grid_columnconfigure(0, weight=1)
-    root.grid_rowconfigure(1, weight=1)
-    root.grid_rowconfigure(2, weight=0)
-    root.grid_rowconfigure(3, weight=0)
-
-    app = OllamaInterface(root)
-
-    app.chat_box.tag_configure(
-        "Bold", foreground="#ff007b", font=(app.default_font, 10, "bold")
-    )
-    app.chat_box.tag_configure("Error", foreground="red")
-    app.chat_box.tag_configure("Right", justify="right")
-
-    root.mainloop()
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle(QStyleFactory.create("Fusion"))
+    
+    # Configurar paleta de cores - tema escuro
+    palette = app.palette()
+    palette.setColor(QPalette.Window, QColor(30, 30, 30))
+    palette.setColor(QPalette.WindowText, Qt.white)
+    palette.setColor(QPalette.Base, QColor(18, 18, 18))
+    palette.setColor(QPalette.AlternateBase, QColor(30, 30, 30))
+    palette.setColor(QPalette.ToolTipBase, Qt.white)
+    palette.setColor(QPalette.ToolTipText, Qt.white)
+    palette.setColor(QPalette.Text, Qt.white)
+    palette.setColor(QPalette.Button, QColor(50, 50, 50))
+    palette.setColor(QPalette.ButtonText, Qt.white)
+    palette.setColor(QPalette.BrightText, Qt.red)
+    palette.setColor(QPalette.Highlight, QColor(142, 45, 197).lighter())
+    palette.setColor(QPalette.HighlightedText, Qt.black)
+    app.setPalette(palette)
+    
+    window = InterfaceOllama()
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    run()
+    main()
