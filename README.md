@@ -1,112 +1,107 @@
-# Ollama-GUI
+# Ollama GUI - Interface gráfica para o Ollama
 
 ![GitHub License](https://img.shields.io/github/license/chyok/ollama-gui)
 ![PyPI - Version](https://img.shields.io/pypi/v/ollama-gui)
 ![PyPI - Python Version](https://img.shields.io/pypi/pyversions/ollama-gui)
 
-A very simple ollama GUI, implemented using the built-in Python Tkinter library, with no additional dependencies.
-Provide you with the simplest possible visual Ollama interface.
+**Ollama GUI** é uma aplicação desktop para Windows, Linux e macOS, desenvolvida em Python com Qt (PySide6), que fornece uma interface gráfica moderna para conversar com modelos de IA locais via [Ollama](https://ollama.com). Permite gerenciar modelos, baixar, excluir e interagir facilmente com LLMs sem depender de linha de comando.
 
-![ollama-gui-1 2 0](https://github.com/user-attachments/assets/a4bb979b-68a4-4062-b484-7542f2a866e0)
+---
 
+## Funcionalidades Principais
 
-## 🚀 Features
-### v1.1.0
-+ 📁 One file project.
-+ 📦 No external dependencies, only **tkinter** which is usually bundled.
-+ 🔍 Auto check ollama model list.
-+ 🌐 Customizable ollama host support.
-+ 💬 Multiple conversations.
-+ 📋 Menu bar and right-click menu.
-+ 🛑 Stop generating at any time.
-### v1.2.0
-+ 🗂️ Model Management: Download and Delete Models.
-+ 🎨 UI Enhancement: Bubble dialog theme.
-+ 📝 Editable Conversation History.
+- **Chat com modelos Ollama:** Interface de conversação com histórico.
+- **Seleção e gerenciamento de modelos:** Baixe, exclua e atualize modelos facilmente.
+- **Detecção automática dos modelos disponíveis.**
+- **Configuração do host e teste de conexão:** Suporte a servidores remotos ou locais.
+- **Barra de progresso e logs detalhados de download/exclusão.**
+- **Formatação de respostas em Markdown (negrito, cabeçalhos).**
+- **Menu de ajuda, atalhos e solução de problemas.**
+- **Tema escuro, responsivo e compatível com diferentes sistemas operacionais.**
 
-## 📎 Before Start
+---
 
-We need to set up Ollama service first.
+## Captura de tela
 
-Please refer to:   
-+ [Ollama](https://ollama.com/)  
-+ [Ollama Github](https://github.com/ollama/ollama)
+*(Adicione aqui uma imagem da interface após rodar o programa!)*
 
-## ⚙️ Run
+---
 
-Choose any way you like:
-> **Note: If you are using a Mac and the system version is Sonoma, please refer to the Q&A at the bottom.**
+## Instalação
 
-### source code
+1. **Clone o repositório ou baixe o arquivo principal.**
 
-```
-python ollama_gui.py
+2. **Instale as dependências** (recomenda-se uso de ambiente virtual):
+
+```bash
+pip install PySide6
 ```
 
-### using pip
+3. **Instale e rode o Ollama no seu sistema**  
+Veja instruções: [Documentação do Ollama](https://ollama.com/docs)
 
-```
-pip install ollama-gui
-ollama-gui
-```
+4. **Execute o programa:**
 
-### binary file
-
-| Platform | Download Link                                            | 
-|----------|----------------------------------------------------------|
-| Windows  | [Download](https://github.com/chyok/ollama-gui/releases) |
-| Mac (Apple Silicon)  | [Download](https://github.com/chyok/ollama-gui/releases) |
-| Linux  | [Download](https://github.com/chyok/ollama-gui/releases) |
-
-## 📋 Q&A
-### I'm using a Mac, why does the application sometimes not respond when I click on it?
-
-The issue affects macOS Sonoma users running applications that use Tcl/Tk versions 8.6.12 or older, including various Python versions.  
-When the mouse cursor is inside the Tkinter window during startup, GUI elements become unresponsive to clicks.
-
-Solution:  
-Update to Tcl/Tk version 8.6.13 or newer, which fixes this problem.   
-  
-For Python users, this can be done by:  
-Using Python 3.11.7 or later, which bundles the fixed Tcl/Tk version.  
-Using Python 3.12 or later, which already includes the fix.  
-https://www.python.org/downloads/macos/
-
-For other Python versions, installing Tcl/Tk 8.6.13+ separately (e.g., via Homebrew) and ensuring Python uses this version.
-
-Here is the issue: https://github.com/python/cpython/issues/110218
-
-------
-
-### ImportError: No module named 'Tkinter'
-
-This probably happens because the Tk library is not installed.
-
-For Ubuntu or other distros with Apt:
-
-```
-sudo apt-get install python3-tk
+```bash
+python seu_arquivo.py
 ```
 
-For Fedora:
+---
 
-```
-sudo dnf install python3-tkinter
-```
+## Como Usar
 
-For macOS:
+- **Certifique-se de que o Ollama está rodando** (`ollama serve`).
+- **Abra o Ollama GUI**.
+- **Selecione o modelo desejado** ou baixe modelos novos via menu "Gerenciar Modelos".
+- **Digite sua mensagem** na caixa inferior e pressione `Enter` (ou clique em "Enviar").
+- **Acompanhe a resposta, histórico e logs na interface**.
+- **Exporte/copie o histórico se desejar**.
+- **Use o menu de ajuda para informações rápidas e solução de problemas**.
 
-```
-brew install python-tk
-```
+---
 
-For Windows:
+## Principais Componentes
 
-make sure to **check in the Python install the optional feature "tcl/tk and IDLE"**.  
+- `InterfaceOllama`: Janela principal de chat e gerenciamento.
+- `JanelaGerenciamento`: Modal para baixar e excluir modelos.
+- `EntradaUsuario`: Caixa de texto personalizada com suporte a atalhos.
+- **Comunicação por sinais/threads** para não travar a interface durante operações.
+- **Formatação Markdown simplificada** para respostas do modelo.
 
-Refer to: https://stackoverflow.com/questions/25905540/importerror-no-module-named-tkinter
+---
 
-## License
+## Recursos Suportados
 
-This project is licensed under the [MIT License](LICENSE).
+- Modelos Ollama locais e remotos.
+- Compatível com Windows, Linux e macOS (incluindo macOS Sonoma, com aviso para travamentos conhecidos).
+- Tema escuro por padrão.
+- Suporte a atalhos (`Enter` para enviar, `Shift+Enter` para nova linha).
 
+---
+
+## Solução de Problemas
+
+- **Erro de conexão:** Verifique se o Ollama está rodando, host e porta corretos, e firewall.
+- **MacOS Sonoma:** Pode apresentar travamento de interface após inicialização. Basta mover o cursor para fora da janela e retornar.
+- **Problemas ao baixar/excluir modelos:** Veja os logs detalhados na área específica.
+
+---
+
+## Licença
+
+Este projeto é distribuído sob a licença MIT.
+
+---
+
+## Autor
+
+Wendell Moura
+GitHub: [https://github.com/chyok/ollama-gui](https://github.com/chyok/ollama-gui)
+
+## Fork
+chyok  
+GitHub: [https://github.com/chyok/ollama-gui](https://github.com/chyok/ollama-gui)
+
+---
+
+*Contribuições e sugestões são bem-vindas!*
