@@ -96,7 +96,6 @@ Este projeto é distribuído sob a licença MIT.
 ## Autor
 
 Wendell Moura
-GitHub: [https://github.com/chyok/ollama-gui](https://github.com/chyok/ollama-gui)
 
 ## Fork
 chyok  
