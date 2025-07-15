@@ -21,7 +21,7 @@ except (ModuleNotFoundError, ImportError):
         "Please refer to https://github.com/chyok/ollama-gui?tab=readme-ov-file#-qa")
     sys.exit(0)
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 
 def _system_check(root: tk.Tk) -> Optional[str]:
