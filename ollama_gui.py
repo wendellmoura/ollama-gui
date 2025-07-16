@@ -11,7 +11,6 @@ import urllib.request
 import socket
 import traceback
 import html
-import re
 from threading import Thread
 from typing import Optional, List, Generator, Tuple, Any
 
@@ -25,18 +24,7 @@ from PySide6.QtGui import (QTextCursor, QFont, QAction, QKeyEvent, QTextCharForm
                           QColor, QPalette, QFontMetrics, QIcon, QTextDocument)
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QObject, QSize, QEvent, QUrl
 
-__version__ = "1.2.2"
-
-# Função simplificada para formatação Markdown
-def formatar_markdown(texto: str) -> str:
-    """Converte apenas **negrito** e ### cabeçalhos"""
-    # Negrito: **texto**
-    texto = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', texto)
-    
-    # Cabeçalhos: ### Texto
-    texto = re.sub(r'^###\s+(.*)$', r'<h3>\1</h3>', texto, flags=re.MULTILINE)
-    
-    return texto
+__version__ = "1.40.0"
 
 # Classe personalizada para entrada de texto
 class EntradaUsuario(QTextEdit):
@@ -85,10 +73,13 @@ class InterfaceOllama(QMainWindow):
         self.signals = WorkerSignals()
         self.caixa_log = None
         self.lista_modelos = None
-        self.ultima_resposta = ""  # Para acumular a resposta do modelo
+        self.thread_geracao = None
+        self.editando = False
+        self.indice_edicao = None
+        self.parar_geracao_atual = False
         
         self.setWindowTitle("Ollama GUI")
-        self.resize(800, 600)
+        self.resize(760, 600)
         
         # Widget central
         central_widget = QWidget()
@@ -139,7 +130,7 @@ class InterfaceOllama(QMainWindow):
         layout_cabecalho.addStretch(1)
         self.layout_principal.addWidget(frame_cabecalho)
         
-        # Área de chat
+        # Área de chat (80% da altura)
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setFrameShape(QFrame.NoFrame)
@@ -147,23 +138,10 @@ class InterfaceOllama(QMainWindow):
         self.caixa_chat = QTextEdit()
         self.caixa_chat.setReadOnly(True)
         self.caixa_chat.setFont(QFont(self.fonte_padrao, 12))
-        
-        # Configurar estilos CSS
-        self.caixa_chat.document().setDefaultStyleSheet("""
-            h3 {
-                color: #ffcc80;
-                font-weight: bold;
-                margin-top: 10px;
-                margin-bottom: 5px;
-            }
-            b {
-                color: #ffffff;
-                font-weight: bold;
-            }
-        """)
-        
+        self.caixa_chat.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.caixa_chat.customContextMenuRequested.connect(self.mostrar_menu_contexto)
         scroll_area.setWidget(self.caixa_chat)
-        self.layout_principal.addWidget(scroll_area, 1)
+        self.layout_principal.addWidget(scroll_area, 8)  # 80% do espaço
         
         # Barra de progresso
         frame_progresso = QWidget()
@@ -178,19 +156,18 @@ class InterfaceOllama(QMainWindow):
         self.botao_parar = QPushButton("Parar")
         self.botao_parar.setVisible(False)
         layout_progresso.addWidget(self.botao_parar)
-        self.botao_parar.clicked.connect(lambda: self.botao_parar.setEnabled(False))
+        self.botao_parar.clicked.connect(self.parar_geracao)
         
         self.layout_principal.addWidget(frame_progresso)
         
-        # Entrada de texto
+        # Entrada de texto (20% da altura)
         frame_entrada = QWidget()
         layout_entrada = QVBoxLayout(frame_entrada)
         layout_entrada.setContentsMargins(0, 0, 0, 0)
         
-        # Usando nossa classe personalizada
         self.entrada_usuario = EntradaUsuario()
         self.entrada_usuario.setFont(QFont(self.fonte_padrao, 12))
-        self.entrada_usuario.setMinimumHeight(100)
+        self.entrada_usuario.setMinimumHeight(50)  # Altura reduzida
         self.entrada_usuario.enterPressed.connect(self.ao_clicar_enviar)
         layout_entrada.addWidget(self.entrada_usuario)
         
@@ -204,7 +181,7 @@ class InterfaceOllama(QMainWindow):
         self.botao_enviar.setEnabled(False)
         
         layout_entrada.addWidget(frame_botoes)
-        self.layout_principal.addWidget(frame_entrada)
+        self.layout_principal.addWidget(frame_entrada, 2)  # 20% do espaço
         
         # Menu
         self.criar_menu()
@@ -264,25 +241,34 @@ class InterfaceOllama(QMainWindow):
             cursor = self.caixa_chat.textCursor()
             cursor.movePosition(QTextCursor.End)
             
+            # Formatação baseada no tipo
             if tipo == "usuario":
-                # Texto do usuário
-                self.caixa_chat.setTextColor(QColor("#e0e0e0"))
+                # Adicionar linha em branco acima e cor diferente para "Você"
+                if self.caixa_chat.toPlainText():
+                    self.caixa_chat.insertPlainText("\n")
+                self.caixa_chat.setTextColor(QColor("#add8e6"))  # Cor azul claro para usuário
                 self.caixa_chat.insertPlainText("Você: " + texto + "\n\n")
+            elif tipo == "usuario_editado":
+                if self.caixa_chat.toPlainText():
+                    self.caixa_chat.insertPlainText("\n")
+                self.caixa_chat.setTextColor(QColor("#90caf9"))  # Cor azul mais forte para edição
+                self.caixa_chat.insertPlainText("Você (Editado): " + texto + "\n\n")
             elif tipo == "modelo":
-                # Texto do modelo - apenas adiciona texto puro
                 self.caixa_chat.setTextColor(QColor("#e0e0e0"))
                 self.caixa_chat.insertPlainText(texto)
             elif tipo == "nome_modelo":
-                # Nome do modelo
                 self.caixa_chat.setTextColor(QColor("#ffcc80"))
                 self.caixa_chat.insertPlainText("Modelo: " + texto + "\n")
             elif tipo == "erro":
-                # Mensagens de erro
                 self.caixa_chat.setTextColor(QColor("#ff6666"))
                 self.caixa_chat.insertPlainText(texto + "\n\n")
             elif tipo == "texto":
                 self.caixa_chat.insertPlainText("\n")
+            elif tipo == "info":
+                self.caixa_chat.setTextColor(QColor("#a5d6a7"))  # Cor verde para informações
+                self.caixa_chat.insertPlainText(texto + "\n")
             
+            # Garantir que o texto seja visível
             cursor.movePosition(QTextCursor.End)
             self.caixa_chat.setTextCursor(cursor)
             self.caixa_chat.ensureCursorVisible()
@@ -394,13 +380,44 @@ class InterfaceOllama(QMainWindow):
             if not mensagem:
                 return
                 
-            self.signals.update_chat.emit(mensagem, "usuario")
-            self.entrada_usuario.clear()
-            self.historico_chat.append({"role": "user", "content": mensagem})
+            # Parar qualquer geração em andamento
+            self.parar_geracao_atual = True
+            time.sleep(0.1)  # Dar tempo para a thread parar
+            
+            if self.editando:
+                # Adicionar mensagem editada
+                self.signals.update_chat.emit(mensagem, "usuario_editado")
+                self.historico_chat[self.indice_edicao] = {"role": "user", "content": mensagem}
+                
+                # Remover respostas após a mensagem editada
+                if len(self.historico_chat) > self.indice_edicao + 1:
+                    self.historico_chat = self.historico_chat[:self.indice_edicao + 1]
+                
+                # Adicionar mensagem informativa sobre a edição
+                self.signals.update_chat.emit("(Mensagem editada, aguardando nova resposta)", "info")
+                
+                self.editando = False
+                self.indice_edicao = None
+            else:
+                # Nova mensagem normal
+                self.signals.update_chat.emit(mensagem, "usuario")
+                self.historico_chat.append({"role": "user", "content": mensagem})
 
-            Thread(target=self.gerar_resposta_ia, daemon=True).start()
+            self.entrada_usuario.clear()
+
+            # Resetar a flag de parada
+            self.parar_geracao_atual = False
+            
+            # Iniciar nova thread para gerar resposta
+            self.thread_geracao = Thread(target=self.gerar_resposta_ia, daemon=True)
+            self.thread_geracao.start()
+            
         except Exception as e:
             self.adicionar_log(f"Erro ao enviar: {str(e)}")
+
+    def parar_geracao(self):
+        self.parar_geracao_atual = True
+        self.botao_parar.setEnabled(False)
 
     def gerar_resposta_ia(self):
         self.signals.show_progress.emit()
@@ -414,66 +431,67 @@ class InterfaceOllama(QMainWindow):
             
             mensagem_ia = ""
             for parte in self.buscar_resposta_chat_stream():
-                if not self.botao_parar.isEnabled():
+                if self.parar_geracao_atual:
                     break
                     
-                # Adicionar parte normalmente
                 self.signals.update_chat.emit(parte, "modelo")
                 mensagem_ia += parte
                 
-            self.historico_chat.append({"role": "assistant", "content": mensagem_ia})
-            self.signals.update_chat.emit("\n", "texto")
-            
-            # Aplicar formatação apenas na resposta completa
-            cursor = self.caixa_chat.textCursor()
-            cursor.movePosition(QTextCursor.End)
-            cursor.select(QTextCursor.BlockUnderCursor)
-            texto_formatado = formatar_markdown(mensagem_ia)
-            cursor.insertHtml(texto_formatado)
+            if not self.parar_geracao_atual and mensagem_ia:
+                self.historico_chat.append({"role": "assistant", "content": mensagem_ia})
+                self.signals.update_chat.emit("\n", "texto")
             
         except socket.timeout:
-            erro = "Tempo esgotado: A resposta demorou muito"
-            self.signals.update_chat.emit(erro, "erro")
-            self.signals.update_chat.emit("\n", "texto")
+            if not self.parar_geracao_atual:
+                erro = "Tempo esgotado: A resposta demorou muito"
+                self.signals.update_chat.emit(erro, "erro")
+                self.signals.update_chat.emit("\n", "texto")
         except urllib.error.URLError as e:
-            erro = f"Erro de conexão: {e.reason}"
-            self.signals.update_chat.emit(erro, "erro")
-            self.signals.update_chat.emit("\n", "texto")
+            if not self.parar_geracao_atual:
+                erro = f"Erro de conexão: {e.reason}"
+                self.signals.update_chat.emit(erro, "erro")
+                self.signals.update_chat.emit("\n", "texto")
         except urllib.error.HTTPError as e:
-            if e.code == 500:
-                erro = "Erro interno no servidor Ollama (500)\n"
-                erro += "Possíveis causas:\n"
-                erro += "• O modelo pode estar corrompido\n"
-                erro += "• Falta de memória no servidor\n"
-                erro += "• Bug no servidor Ollama\n\n"
-                erro += "Soluções sugeridas:\n"
-                erro += "1. Reinicie o servidor Ollama\n"
-                erro += "2. Tente outro modelo\n"
-                erro += "3. Verifique os logs do servidor"
-            else:
-                erro = f"Erro HTTP {e.code}: {e.reason}"
-            self.signals.update_chat.emit(erro, "erro")
-            self.signals.update_chat.emit("\n", "texto")
+            if not self.parar_geracao_atual:
+                if e.code == 500:
+                    erro = "Erro interno no servidor Ollama (500)\n"
+                    erro += "Possíveis causas:\n"
+                    erro += "• O modelo pode estar corrompido\n"
+                    erro += "• Falta de memória no servidor\n"
+                    erro += "• Bug no servidor Ollama\n\n"
+                    erro += "Soluções sugeridas:\n"
+                    erro += "1. Reinicie o servidor Ollama\n"
+                    erro += "2. Tente outro modelo\n"
+                    erro += "3. Verifique os logs do servidor"
+                else:
+                    erro = f"Erro HTTP {e.code}: {e.reason}"
+                self.signals.update_chat.emit(erro, "erro")
+                self.signals.update_chat.emit("\n", "texto")
         except json.JSONDecodeError:
-            erro = "Resposta inválida do servidor"
-            self.signals.update_chat.emit(erro, "erro")
-            self.signals.update_chat.emit("\n", "texto")
+            if not self.parar_geracao_atual:
+                erro = "Resposta inválida do servidor"
+                self.signals.update_chat.emit(erro, "erro")
+                self.signals.update_chat.emit("\n", "texto")
         except ModeloNaoEncontradoError:
-            erro = "Modelo não encontrado"
-            self.signals.update_chat.emit(erro, "erro")
-            self.signals.update_chat.emit("\n", "texto")
+            if not self.parar_geracao_atual:
+                erro = "Modelo não encontrado"
+                self.signals.update_chat.emit(erro, "erro")
+                self.signals.update_chat.emit("\n", "texto")
         except ErroConexaoError as e:
-            erro = f"Falha na conexão: {str(e)}"
-            self.signals.update_chat.emit(erro, "erro")
-            self.signals.update_chat.emit("\n", "texto")
+            if not self.parar_geracao_atual:
+                erro = f"Falha na conexão: {str(e)}"
+                self.signals.update_chat.emit(erro, "erro")
+                self.signals.update_chat.emit("\n", "texto")
         except ErroServidorError as e:
-            erro = f"Erro no servidor: {str(e)}"
-            self.signals.update_chat.emit(erro, "erro")
-            self.signals.update_chat.emit("\n", "texto")
+            if not self.parar_geracao_atual:
+                erro = f"Erro no servidor: {str(e)}"
+                self.signals.update_chat.emit(erro, "erro")
+                self.signals.update_chat.emit("\n", "texto")
         except Exception as e:
-            erro = f"Erro inesperado: {type(e).__name__}"
-            self.signals.update_chat.emit(erro, "erro")
-            self.signals.update_chat.emit("\n", "texto")
+            if not self.parar_geracao_atual:
+                erro = f"Erro inesperado: {type(e).__name__}"
+                self.signals.update_chat.emit(erro, "erro")
+                self.signals.update_chat.emit("\n", "texto")
         finally:
             self.signals.hide_progress.emit()
             self.signals.enable_button.emit("enviar", True)
@@ -525,7 +543,7 @@ class InterfaceOllama(QMainWindow):
                     raise ErroServidorError(f"Status HTTP inesperado: {resp.status}")
                 
                 for linha in resp:
-                    if not self.botao_parar.isEnabled():  # parar
+                    if self.parar_geracao_atual:  # Verificar se foi solicitado parar
                         break
                     dados = json.loads(linha.decode("utf-8"))
                     if "message" in dados:
@@ -585,7 +603,8 @@ class InterfaceOllama(QMainWindow):
         try:
             self.caixa_chat.clear()
             self.historico_chat.clear()
-            self.ultima_resposta = ""
+            self.editando = False
+            self.indice_edicao = None
         except Exception as e:
             self.adicionar_log(f"Erro ao limpar chat: {str(e)}")
 
@@ -695,6 +714,70 @@ class InterfaceOllama(QMainWindow):
         finally:
             self.signals.update_model_list.emit(self.buscar_modelos())
             self.signals.update_model_combo.emit(self.buscar_modelos())
+
+    # Método corrigido para mostrar menu de contexto no chat
+    def mostrar_menu_contexto(self, pos):
+        menu = QMenu()
+        
+        # Obter a posição do cursor no texto
+        cursor = self.caixa_chat.cursorForPosition(pos)
+        cursor.select(QTextCursor.LineUnderCursor)
+        linha = cursor.selectedText()
+        
+        # Verificar se a linha começa com "Você: " ou "Você (Editado): "
+        if linha.startswith("Você:") or linha.startswith("Você (Editado):"):
+            # Extrair o índice da mensagem no histórico
+            idx = self.obter_indice_mensagem(cursor)
+            if idx is not None:
+                editar_action = menu.addAction("Editar Mensagem")
+                action = menu.exec(self.caixa_chat.mapToGlobal(pos))  # Corrigido para exec()
+                
+                if action == editar_action:
+                    self.editar_mensagem(idx)
+    
+    def obter_indice_mensagem(self, cursor):
+        # Obter o documento e o bloco atual
+        doc = self.caixa_chat.document()
+        block = doc.findBlock(cursor.position())
+        block_text = block.text().strip()
+        
+        # Verificar se é uma mensagem de usuário
+        if not block_text.startswith(("Você:", "Você (Editado):")):
+            return None
+
+        # Encontrar o índice da mensagem baseado no conteúdo
+        user_messages = [msg for msg in self.historico_chat if msg["role"] == "user"]
+        
+        # Procurar o conteúdo no histórico
+        for i, msg in enumerate(user_messages):
+            # Remover prefixos para comparação
+            if block_text.replace("Você:", "").replace("Você (Editado):", "").strip() == msg["content"]:
+                # Calcular índice completo (2 * índice do usuário)
+                return 2 * i
+                
+        return None
+
+    def editar_mensagem(self, idx):
+        # Parar qualquer geração em andamento
+        self.parar_geracao()
+            
+        # Verificar se o índice é válido
+        if idx < 0 or idx >= len(self.historico_chat):
+            return
+            
+        if self.historico_chat[idx]["role"] != "user":
+            return
+            
+        # Obter a mensagem
+        mensagem_original = self.historico_chat[idx]["content"]
+        
+        # Configurar estado de edição
+        self.editando = True
+        self.indice_edicao = idx
+        
+        # Colocar a mensagem na área de entrada para edição
+        self.entrada_usuario.setPlainText(mensagem_original)
+        self.entrada_usuario.setFocus()
 
 
 class JanelaGerenciamento(QDialog):
